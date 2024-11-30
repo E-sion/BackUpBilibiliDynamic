@@ -1,0 +1,270 @@
+import os
+import json
+import requests
+import shutil
+import subprocess
+from datetime import datetime
+from pyfiglet import Figlet
+import time
+
+
+class BilibiliDynamicProcessor:
+    """
+    A class to process Bilibili dynamic posts, download them, convert to markdown, and deploy to Hexo blog.
+    """
+
+    def __init__(self, cookie, user_id,hexo_posts_dir,images_dir):
+        """
+        Initialize the processor with necessary configurations.
+
+        Args:
+            cookie (str): Bilibili authentication cookie
+            user_id (int): Bilibili user ID to fetch dynamics from
+        """
+        self.cookie = cookie
+        self.user_id = user_id
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+            'cookie': cookie
+        }
+
+        # Directory configurations
+        # 会在当前的这个目录保存所有的动态json
+        self.json_dir = 'bili_json'
+        # 在当前目录生成claude3.5_md
+        self.markdown_dir = 'claude3.5_md'
+        # 图片下载保存目录
+        self.images_dir = images_dir
+        # 程序会将当前目录下生成的文件再复制一遍到这个目录
+        self.hexo_posts_dir = hexo_posts_dir
+
+    def fetch_dynamics(self):
+        """
+        Fetch all dynamic posts from Bilibili and save them as JSON files.
+        """
+
+        def _fetch_single_page(offset_dynamic_id=0, file_suffix="1"):
+            url = f"https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/space_history?host_uid={self.user_id}&offset_dynamic_id={offset_dynamic_id}"
+            response = requests.get(url, headers=self.headers)
+
+            if response.status_code != 200:
+                print("请求失败，状态码:", response.status_code)
+                return
+
+            data = response.json()
+            cards = data.get("data", {}).get("cards", None)
+
+            if cards is None:
+                f = Figlet(font='slant')
+                print(f.renderText('Error！'))
+                print(
+                    '请前往重置COOKIE：： https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/space_history?host_uid=660239155')
+                exit()
+
+            current_date = datetime.now().strftime('%Y_%m_%d')
+            os.makedirs(f'{self.json_dir}/{current_date}', exist_ok=True)
+
+            with open(f'{self.json_dir}/{current_date}/{file_suffix}.json', 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+
+            print(f"成功保存 {current_date}  {file_suffix}.json")
+
+            next_offset = data.get("data", {}).get("next_offset", 0)
+            if next_offset != 0:
+                print(f"发现下一个 offset: {next_offset}, 继续获取...")
+                _fetch_single_page(next_offset, str(int(file_suffix) + 1))
+
+        _fetch_single_page()
+
+    def download_image(self, url, dynamic_id_str, index=0):
+        """
+        Download an image from URL and save it to the images directory.
+
+        Args:
+            url (str): Image URL to download
+            dynamic_id_str (str): The dynamic_id_str from the Bilibili post
+            index (int): Index for multiple images in the same post
+
+        Returns:
+            str: Local filename of the downloaded image
+        """
+        if not os.path.exists(self.images_dir):
+            os.makedirs(self.images_dir)
+
+        # Extract file extension from URL
+        file_extension = os.path.splitext(url)[1]
+        if not file_extension:
+            file_extension = '.jpg'  # Default to .jpg if no extension found
+
+        # Create filename using dynamic_id and index
+        save_name = f"{dynamic_id_str}_{index}{file_extension}"
+        save_path = os.path.join(self.images_dir, save_name)
+
+        while True:
+            response = requests.get(url, stream=True)
+            if response.status_code == 200:
+                with open(save_path, 'wb') as file:
+                    for chunk in response.iter_content(chunk_size=1024):
+                        file.write(chunk)
+                return save_name
+            else:
+                print(f"下载失败，状态码: {response.status_code}，3分钟后重试...")
+                time.sleep(180)
+
+    def _create_markdown_file(self, timestamp, content, images, dynamic_id_str):
+        """
+        Create a markdown file with the specified content and downloaded images.
+
+        Args:
+            timestamp (int): Post timestamp
+            content (str): Post content
+            images (list): List of image URLs
+            dynamic_id_str (str): The dynamic_id_str from the Bilibili post
+
+        Returns:
+            str: Created filename or None if failed
+
+        More：
+            这边可以自定义生成的文章格式，你可以修改为任意格式以适应你的博客需求格式
+        """
+        title = datetime.fromtimestamp(timestamp).strftime('%Y年%m月%d日 %H.%M')
+        filename = f"{title}.md"
+
+        md_content = f'''---
+title: {title}
+date: {datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')}
+---\n\n{content}\n\n'''
+
+        # Download and add images with proper indices
+        for index, img_url in enumerate(images):
+            if img_url:
+                # 这边会把动态对应的图片添加到对应的文章内
+                # 图片名称为动态ID+动态图片数量
+                local_file_name = self.download_image(img_url, dynamic_id_str, index)
+                md_content += f"![image](/images/{local_file_name})\n"
+
+        os.makedirs(self.markdown_dir, exist_ok=True)
+        output_path = os.path.join(self.markdown_dir, filename)
+
+        try:
+            with open(output_path, 'w', encoding='utf-8') as file:
+                file.write(md_content)
+            return filename
+        except Exception as e:
+            print(f"Error writing file {filename}: {str(e)}")
+            return None
+
+    def convert_to_markdown(self):
+        """
+        Convert all JSON files to Markdown format.
+        """
+
+        def _parse_content_and_images(card_data, card_type):
+            content = ""
+            images = []
+
+            if isinstance(card_data, str):
+                try:
+                    card_data = json.loads(card_data)
+                except json.JSONDecodeError:
+                    return content, images
+
+            if card_type == 4:
+                content = card_data.get('item', {}).get('content', '')
+            elif card_type == 2:
+                content = card_data.get('item', {}).get('description', '')
+                if 'pictures' in card_data.get('item', {}):
+                    images = [pic.get('img_src', '') for pic in card_data['item']['pictures']]
+
+            return content, images
+
+        global_index = 1
+        for root, _, files in os.walk(self.json_dir):
+            for file in sorted(files):
+                if file.endswith('.json'):
+                    json_path = os.path.join(root, file)
+                    print(f"\nProcessing file: {json_path}")
+
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+
+                    if data.get('code') != 0 or 'data' not in data or 'cards' not in data['data']:
+                        print(f"Invalid JSON format or error in data: {json_path}")
+                        continue
+
+                    for index, card in enumerate(data['data']['cards'], 1):
+                        try:
+                            desc = card['desc']
+                            content, images = _parse_content_and_images(card['card'], desc['type'])
+
+                            if not content and not images:
+                                continue
+
+                            filename = self._create_markdown_file(
+                                desc['timestamp'],
+                                content,
+                                images,
+                                desc.get('dynamic_id_str', str(desc.get('dynamic_id', '')))
+                            )
+
+                            if filename:
+                                print(f"Created file: {filename}")
+                                global_index += 1
+
+                        except Exception as e:
+                            print(f"Error processing card {index} in {json_path}: {str(e)}")
+                            continue
+
+    def deploy_to_hexo(self):
+        """
+        Copy markdown files to Hexo posts directory and generate static files.
+        """
+        if not all(os.path.exists(path) for path in [self.markdown_dir, self.hexo_posts_dir]):
+            print("Required directories do not exist")
+            return
+
+        for file_name in os.listdir(self.markdown_dir):
+            src_path = os.path.join(self.markdown_dir, file_name)
+            dst_path = os.path.join(self.hexo_posts_dir, file_name)
+
+            if os.path.isfile(src_path):
+                if os.path.exists(dst_path):
+                    print(f"目标目录已存在同名文件，跳过: {file_name}")
+                else:
+                    shutil.copy(src_path, dst_path)
+                    print(f"成功复制文件: {file_name}")
+
+        try:
+            print(f"切换到目标目录并执行 `hexo g`: {self.hexo_posts_dir}")
+            subprocess.run("hexo g", cwd=os.path.dirname(self.hexo_posts_dir), shell=True, check=True)
+            print("`hexo g` 命令执行成功")
+        except subprocess.CalledProcessError as e:
+            print(f"`hexo g` 命令执行失败: {e}")
+
+    def process_all(self):
+        """
+        Execute the complete workflow: fetch dynamics, convert to markdown, and deploy to Hexo.
+        """
+        print("Starting Bilibili dynamic posts processing...")
+        self.fetch_dynamics()
+        self.convert_to_markdown()
+        self.deploy_to_hexo()
+        print("Processing complete!")
+
+
+# Example usage
+def main():
+    # 需要备份的用户ID
+    user_id = 
+    # 自己的cooike
+    cookie = ''''''
+    # 程序会将当前目录下生成的文件再复制一遍到这个目录
+    hexo_posts_dir = r""
+    # 图片下载保存目录
+    images_dir = r""
+
+    processor = BilibiliDynamicProcessor(cookie, user_id,hexo_posts_dir,images_dir)
+    processor.process_all()
+
+if __name__ == "__main__":
+    main()
